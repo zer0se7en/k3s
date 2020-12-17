@@ -4,7 +4,6 @@ import (
 	"crypto"
 	"crypto/x509"
 	"errors"
-	"fmt"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -16,8 +15,9 @@ import (
 	certutil "github.com/rancher/dynamiclistener/cert"
 	"github.com/rancher/k3s/pkg/bootstrap"
 	"github.com/rancher/k3s/pkg/daemons/config"
-	"github.com/rancher/k3s/pkg/passwd"
+	"github.com/rancher/k3s/pkg/nodepassword"
 	"github.com/rancher/k3s/pkg/version"
+	coreclient "github.com/rancher/wrangler-api/pkg/generated/controllers/core/v1"
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/util/json"
 )
@@ -26,13 +26,13 @@ const (
 	staticURL = "/static/"
 )
 
-func router(serverConfig *config.Control, tunnel http.Handler, ca []byte) http.Handler {
+func router(serverConfig *config.Control) http.Handler {
 	prefix := "/v1-" + version.Program
 	authed := mux.NewRouter()
 	authed.Use(authMiddleware(serverConfig, version.Program+":agent"))
 	authed.NotFoundHandler = serverConfig.Runtime.Handler
-	authed.Path(prefix + "/serving-kubelet.crt").Handler(servingKubeletCert(serverConfig, serverConfig.Runtime.ServingKubeletKey))
-	authed.Path(prefix + "/client-kubelet.crt").Handler(clientKubeletCert(serverConfig, serverConfig.Runtime.ClientKubeletKey))
+	authed.Path(prefix + "/serving-kubelet.crt").Handler(servingKubeletCert(serverConfig, serverConfig.Runtime.ServingKubeletKey, serverConfig.Runtime))
+	authed.Path(prefix + "/client-kubelet.crt").Handler(clientKubeletCert(serverConfig, serverConfig.Runtime.ClientKubeletKey, serverConfig.Runtime))
 	authed.Path(prefix + "/client-kube-proxy.crt").Handler(fileHandler(serverConfig.Runtime.ClientKubeProxyCert, serverConfig.Runtime.ClientKubeProxyKey))
 	authed.Path(prefix + "/client-" + version.Program + "-controller.crt").Handler(fileHandler(serverConfig.Runtime.ClientK3sControllerCert, serverConfig.Runtime.ClientK3sControllerKey))
 	authed.Path(prefix + "/client-ca.crt").Handler(fileHandler(serverConfig.Runtime.ClientCA))
@@ -41,7 +41,7 @@ func router(serverConfig *config.Control, tunnel http.Handler, ca []byte) http.H
 
 	nodeAuthed := mux.NewRouter()
 	nodeAuthed.Use(authMiddleware(serverConfig, "system:nodes"))
-	nodeAuthed.Path(prefix + "/connect").Handler(tunnel)
+	nodeAuthed.Path(prefix + "/connect").Handler(serverConfig.Runtime.Tunnel)
 	nodeAuthed.NotFoundHandler = authed
 
 	serverAuthed := mux.NewRouter()
@@ -56,14 +56,23 @@ func router(serverConfig *config.Control, tunnel http.Handler, ca []byte) http.H
 	router := mux.NewRouter()
 	router.NotFoundHandler = serverAuthed
 	router.PathPrefix(staticURL).Handler(serveStatic(staticURL, staticDir))
-	router.Path("/cacerts").Handler(cacerts(ca))
+	router.Path("/cacerts").Handler(cacerts(serverConfig.Runtime.ServerCA))
 	router.Path("/ping").Handler(ping())
 
 	return router
 }
 
-func cacerts(ca []byte) http.Handler {
+func cacerts(serverCA string) http.Handler {
+	var ca []byte
 	return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
+		if ca == nil {
+			var err error
+			ca, err = ioutil.ReadFile(serverCA)
+			if err != nil {
+				sendError(err, resp)
+				return
+			}
+		}
 		resp.Header().Set("content-type", "text/plain")
 		resp.Write(ca)
 	})
@@ -117,8 +126,17 @@ func getCACertAndKeys(caCertFile, caKeyFile, signingKeyFile string) ([]*x509.Cer
 	return caCert, caKey.(crypto.Signer), key.(crypto.Signer), nil
 }
 
-func servingKubeletCert(server *config.Control, keyFile string) http.Handler {
+func servingKubeletCert(server *config.Control, keyFile string, runtime *config.ControlRuntime) http.Handler {
+	var secretClient coreclient.SecretClient
 	return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
+		if secretClient == nil {
+			if runtime.Core == nil {
+				sendError(errors.New("runtime core not ready"), resp)
+				return
+			}
+			secretClient = runtime.Core.Core().V1().Secret()
+		}
+
 		if req.TLS == nil {
 			resp.WriteHeader(http.StatusNotFound)
 			return
@@ -130,7 +148,7 @@ func servingKubeletCert(server *config.Control, keyFile string) http.Handler {
 			return
 		}
 
-		if err := ensureNodePassword(server.Runtime.NodePasswdFile, nodeName, nodePassword); err != nil {
+		if err := nodepassword.Ensure(secretClient, nodeName, nodePassword); err != nil {
 			sendError(err, resp, http.StatusForbidden)
 			return
 		}
@@ -170,8 +188,17 @@ func servingKubeletCert(server *config.Control, keyFile string) http.Handler {
 	})
 }
 
-func clientKubeletCert(server *config.Control, keyFile string) http.Handler {
+func clientKubeletCert(server *config.Control, keyFile string, runtime *config.ControlRuntime) http.Handler {
+	var secretClient coreclient.SecretClient
 	return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
+		if secretClient == nil {
+			if runtime.Core == nil {
+				sendError(errors.New("runtime core not ready"), resp)
+				return
+			}
+			secretClient = runtime.Core.Core().V1().Secret()
+		}
+
 		if req.TLS == nil {
 			resp.WriteHeader(http.StatusNotFound)
 			return
@@ -183,7 +210,7 @@ func clientKubeletCert(server *config.Control, keyFile string) http.Handler {
 			return
 		}
 
-		if err := ensureNodePassword(server.Runtime.NodePasswdFile, nodeName, nodePassword); err != nil {
+		if err := nodepassword.Ensure(secretClient, nodeName, nodePassword); err != nil {
 			sendError(err, resp, http.StatusForbidden)
 			return
 		}
@@ -273,21 +300,4 @@ func sendError(err error, resp http.ResponseWriter, status ...int) {
 	logrus.Error(err)
 	resp.WriteHeader(code)
 	resp.Write([]byte(err.Error()))
-}
-
-func ensureNodePassword(passwdFile, nodeName, pass string) error {
-	passwd, err := passwd.Read(passwdFile)
-	if err != nil {
-		return err
-	}
-	match, exists := passwd.Check(nodeName, pass)
-	if exists {
-		if !match {
-			return fmt.Errorf("Node password validation failed for '%s', using passwd file '%s'", nodeName, passwdFile)
-		}
-		return nil
-	}
-	// If user doesn't exist we save this password for future validation
-	passwd.EnsureUser(nodeName, "", pass)
-	return passwd.Write(passwdFile)
 }

@@ -224,7 +224,13 @@ setup_env() {
     if [ -n "${INSTALL_K3S_BIN_DIR}" ]; then
         BIN_DIR=${INSTALL_K3S_BIN_DIR}
     else
+        # --- use /usr/local/bin if root can write to it, otherwise use /opt/bin if it exists
         BIN_DIR=/usr/local/bin
+        if ! $SUDO sh -c "touch ${BIN_DIR}/k3s-ro-test && rm -rf ${BIN_DIR}/k3s-ro-test"; then
+            if [ -d /opt/bin ]; then
+                BIN_DIR=/opt/bin
+            fi
+        fi
     fi
 
     # --- use systemd directory if defined or create default ---
@@ -454,7 +460,7 @@ setup_selinux() {
     yum install -y https://${rpm_site}/k3s/${rpm_channel}/common/centos/7/noarch/k3s-selinux-0.2-1.el7_8.noarch.rpm
 "
     policy_error=fatal
-    if [ "$INSTALL_K3S_SELINUX_WARN" = true ]; then
+    if [ "$INSTALL_K3S_SELINUX_WARN" = true ] || grep -q 'ID=flatcar' /etc/os-release; then
         policy_error=warn
     fi
 
@@ -604,14 +610,17 @@ getshims() {
 
 killtree $({ set +x; } 2>/dev/null; getshims; set -x)
 
-do_unmount() {
-    awk -v path="$1" '$2 ~ ("^" path) { print $2 }' /proc/self/mounts | sort -r | xargs -r -t -n 1 umount
+do_unmount_and_remove() {
+    awk -v path="$1" '$2 ~ ("^" path) { print $2 }' /proc/self/mounts | sort -r | xargs -r -t -n 1 sh -c 'umount "$0" && rm -rf "$0"'
 }
 
-do_unmount '/run/k3s'
-do_unmount '/var/lib/rancher/k3s'
-do_unmount '/var/lib/kubelet/pods'
-do_unmount '/run/netns/cni-'
+do_unmount_and_remove '/run/k3s'
+do_unmount_and_remove '/var/lib/rancher/k3s'
+do_unmount_and_remove '/var/lib/kubelet/pods'
+do_unmount_and_remove '/run/netns/cni-'
+
+# Remove CNI namespaces
+ip netns show 2>/dev/null | grep cni- | xargs -r -t -n 1 ip netns delete
 
 # Delete network interface(s) that match 'master cni0'
 ip link show 2>/dev/null | grep 'master cni0' | while read ignore iface ignore; do

@@ -3,6 +3,7 @@ package cmds
 import (
 	"fmt"
 	"os"
+	"runtime"
 
 	"github.com/rancher/k3s/pkg/version"
 	"github.com/sirupsen/logrus"
@@ -33,9 +34,14 @@ func NewApp() *cli.App {
 	app.Version = fmt.Sprintf("%s (%s)", version.Version, version.GitCommit)
 	cli.VersionPrinter = func(c *cli.Context) {
 		fmt.Printf("%s version %s\n", app.Name, app.Version)
+		fmt.Printf("go version %s\n", runtime.Version())
 	}
 	app.Flags = []cli.Flag{
 		DebugFlag,
+		cli.StringFlag{
+			Name:  "data-dir,d",
+			Usage: "(data) Folder to hold state default /var/lib/rancher/" + version.Program + " or ${HOME}/.rancher/" + version.Program + " if not root",
+		},
 	}
 	app.Before = SetupDebug(nil)
 
