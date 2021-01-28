@@ -171,12 +171,12 @@ export -f dump-logs
 # ---
 
 retrieve-sonobuoy-logs() {
-    sonobuoy status || true
-
     local status=passed
     local code=0
+    local testStatus=$(sonobuoy status 2>&1)
+    cat <<< $testStatus
 
-    if ! sonobuoy status | grep -q -E ' +e2e +complete +passed +'; then
+    if ! grep -q -E '\s+e2e\s+complete\s+passed\s+' <<< $testStatus; then
         status=failed
         code=1
     fi
@@ -234,7 +234,6 @@ sonobuoy-test() {
     sonobuoy run \
         --config=scripts/sonobuoy-config.json \
         --plugin-env=e2e.E2E_USE_GO_RUNNER=true \
-        --sonobuoy-image=rancher/sonobuoy-sonobuoy:v${SONOBUOY_VERSION:-0.19.0} \
         --kube-conformance-image-version=${VERSION_K8S} \
         --wait=90 \
         $@ &
