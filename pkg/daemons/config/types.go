@@ -11,6 +11,7 @@ import (
 
 	"github.com/k3s-io/kine/pkg/endpoint"
 	"github.com/rancher/wrangler-api/pkg/generated/controllers/core"
+	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 )
 
@@ -37,6 +38,7 @@ type Node struct {
 	AgentConfig              Agent
 	CACerts                  []byte
 	Certificate              *tls.Certificate
+	ServerHTTPSPort          int
 }
 
 type Containerd struct {
@@ -56,6 +58,8 @@ type Agent struct {
 	NodeConfigPath          string
 	ServingKubeletCert      string
 	ServingKubeletKey       string
+	ServiceCIDR             net.IPNet
+	ServiceNodePortRange    utilnet.PortRange
 	ClusterCIDR             net.IPNet
 	ClusterDNS              net.IP
 	ClusterDomain           string
@@ -81,6 +85,7 @@ type Agent struct {
 	IPSECPSK                string
 	StrongSwanDir           string
 	PrivateRegistry         string
+	AirgapExtraRegistry     []string
 	DisableCCM              bool
 	DisableNPC              bool
 	DisableKubeProxy        bool
@@ -102,6 +107,7 @@ type Control struct {
 	Token                    string `json:"-"`
 	ClusterIPRange           *net.IPNet
 	ServiceIPRange           *net.IPNet
+	ServiceNodePortRange     *utilnet.PortRange
 	ClusterDNS               net.IP
 	ClusterDomain            string
 	NoCoreDNS                bool
@@ -111,7 +117,6 @@ type Control struct {
 	Skips                    map[string]bool
 	Disables                 map[string]bool
 	Datastore                endpoint.Config
-	NoScheduler              bool
 	ExtraAPIArgs             []string
 	ExtraControllerArgs      []string
 	ExtraCloudControllerArgs []string
@@ -124,6 +129,10 @@ type Control struct {
 	DisableCCM               bool
 	DisableNPC               bool
 	DisableKubeProxy         bool
+	DisableAPIServer         bool
+	DisableControllerManager bool
+	DisableScheduler         bool
+	DisableETCD              bool
 	ClusterInit              bool
 	ClusterReset             bool
 	ClusterResetRestorePath  string
@@ -136,6 +145,15 @@ type Control struct {
 	EtcdSnapshotDir          string
 	EtcdSnapshotCron         string
 	EtcdSnapshotRetention    int
+	EtcdS3                   bool
+	EtcdS3Endpoint           string
+	EtcdS3EndpointCA         string
+	EtcdS3SkipSSLVerify      bool
+	EtcdS3AccessKey          string
+	EtcdS3SecretKey          string
+	EtcdS3BucketName         string
+	EtcdS3Region             string
+	EtcdS3Folder             string
 
 	BindAddress string
 	SANs        []string

@@ -14,7 +14,10 @@ type Agent struct {
 	TokenFile                string
 	ClusterSecret            string
 	ServerURL                string
+	APIAddressCh             chan string
 	DisableLoadBalancer      bool
+	ETCDAgent                bool
+	LBServerPort             int
 	ResolvConf               string
 	DataDir                  string
 	NodeIP                   string
@@ -33,12 +36,13 @@ type Agent struct {
 	WithNodeID               bool
 	EnableSELinux            bool
 	ProtectKernelDefaults    bool
+	PrivateRegistry          string
+	AirgapExtraRegistry      cli.StringSlice
+	ExtraKubeletArgs         cli.StringSlice
+	ExtraKubeProxyArgs       cli.StringSlice
+	Labels                   cli.StringSlice
+	Taints                   cli.StringSlice
 	AgentShared
-	ExtraKubeletArgs   cli.StringSlice
-	ExtraKubeProxyArgs cli.StringSlice
-	Labels             cli.StringSlice
-	Taints             cli.StringSlice
-	PrivateRegistry    string
 }
 
 type AgentShared struct {
@@ -84,6 +88,12 @@ var (
 		Usage:       "(agent/runtime) Private registry configuration file",
 		Destination: &AgentConfig.PrivateRegistry,
 		Value:       "/etc/rancher/" + version.Program + "/registries.yaml",
+	}
+	AirgapExtraRegistryFlag = cli.StringSliceFlag{
+		Name:   "airgap-extra-registry",
+		Usage:  "(agent/runtime) Additional registry to tag airgap images as being sourced from",
+		Value:  &AgentConfig.AirgapExtraRegistry,
+		Hidden: true,
 	}
 	PauseImageFlag = cli.StringFlag{
 		Name:        "pause-image",
@@ -155,6 +165,14 @@ var (
 		Destination: &AgentConfig.EnableSELinux,
 		EnvVar:      version.ProgramUpper + "_SELINUX",
 	}
+	LBServerPortFlag = cli.IntFlag{
+		Name:        "lb-server-port",
+		Usage:       "(agent/node) Local port for supervisor client load-balancer. If the supervisor and apiserver are not colocated an additional port 1 less than this port will also be used for the apiserver client load-balancer.",
+		Hidden:      false,
+		Destination: &AgentConfig.LBServerPort,
+		EnvVar:      version.ProgramUpper + "_LB_SERVER_PORT",
+		Value:       6444,
+	}
 )
 
 func CheckSELinuxFlags(ctx *cli.Context) error {
@@ -214,6 +232,7 @@ func NewAgentCommand(action func(ctx *cli.Context) error) cli.Command {
 			PauseImageFlag,
 			SnapshotterFlag,
 			PrivateRegistryFlag,
+			AirgapExtraRegistryFlag,
 			NodeIPFlag,
 			NodeExternalIPFlag,
 			ResolvConfFlag,
@@ -228,6 +247,7 @@ func NewAgentCommand(action func(ctx *cli.Context) error) cli.Command {
 				Destination: &AgentConfig.Rootless,
 			},
 			&SELinuxFlag,
+			LBServerPortFlag,
 
 			// Deprecated/hidden below
 
