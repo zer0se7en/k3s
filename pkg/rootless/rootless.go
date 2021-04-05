@@ -8,8 +8,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
+	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/pkg/errors"
 	"github.com/rootless-containers/rootlesskit/pkg/child"
 	"github.com/rootless-containers/rootlesskit/pkg/copyup/tmpfssymlink"
@@ -17,12 +19,14 @@ import (
 	"github.com/rootless-containers/rootlesskit/pkg/parent"
 	portbuiltin "github.com/rootless-containers/rootlesskit/pkg/port/builtin"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
 var (
-	pipeFD   = "_K3S_ROOTLESS_FD"
-	childEnv = "_K3S_ROOTLESS_SOCK"
-	Sock     = ""
+	pipeFD             = "_K3S_ROOTLESS_FD"
+	childEnv           = "_K3S_ROOTLESS_SOCK"
+	evacuateCgroup2Env = "_K3S_ROOTLESS_EVACUATE_CGROUP2" // boolean
+	Sock               = ""
 )
 
 func Rootless(stateDir string) error {
@@ -61,6 +65,9 @@ func Rootless(stateDir string) error {
 	}
 
 	os.Setenv(childEnv, filepath.Join(parentOpt.StateDir, parent.StateFileAPISock))
+	if parentOpt.EvacuateCgroup2 != "" {
+		os.Setenv(evacuateCgroup2Env, "1")
+	}
 	if err := parent.Parent(*parentOpt); err != nil {
 		logrus.Fatal(err)
 	}
@@ -78,10 +85,6 @@ func validateSysctl() error {
 		// However, the current k3s implementation has a bug that requires net.ipv4.ip_forward=1
 		// https://github.com/rancher/k3s/issues/2420#issuecomment-715051120
 		"net.ipv4.ip_forward": "1",
-
-		// Currently, kernel.dmesg_restrict needs to be 0 to allow OOM-related messages
-		// https://github.com/rootless-containers/usernetes/issues/204
-		"kernel.dmesg_restrict": "0",
 	}
 	for key, expectedValue := range expected {
 		if actualValue, err := readSysctl(key); err == nil {
@@ -128,8 +131,26 @@ func createParentOpt(stateDir string) (*parent.Opt, error) {
 	}
 
 	opt := &parent.Opt{
-		StateDir:    stateDir,
-		CreatePIDNS: true,
+		StateDir:       stateDir,
+		CreatePIDNS:    true,
+		CreateCgroupNS: true,
+		CreateUTSNS:    true,
+		CreateIPCNS:    true,
+	}
+
+	selfCgroupMap, err := cgroups.ParseCgroupFile("/proc/self/cgroup")
+	if err != nil {
+		return nil, err
+	}
+	if selfCgroup2 := selfCgroupMap[""]; selfCgroup2 == "" {
+		logrus.Warnf("enabling cgroup2 is highly recommended, see https://rootlesscontaine.rs/getting-started/common/cgroup2/")
+	} else {
+		selfCgroup2Dir := filepath.Join("/sys/fs/cgroup", selfCgroup2)
+		if unix.Access(selfCgroup2Dir, unix.W_OK) == nil {
+			opt.EvacuateCgroup2 = "k3s_evac"
+		} else {
+			logrus.Warn("cannot set cgroup2 evacuation, make sure to run k3s as a systemd unit")
+		}
 	}
 
 	mtu := 0
@@ -143,7 +164,7 @@ func createParentOpt(stateDir string) (*parent.Opt, error) {
 		return nil, err
 	}
 	debugWriter := &logrusDebugWriter{}
-	opt.NetworkDriver, err = slirp4netns.NewParentDriver(debugWriter, binary, mtu, ipnet, disableHostLoopback, "", false, false)
+	opt.NetworkDriver, err = slirp4netns.NewParentDriver(debugWriter, binary, mtu, ipnet, "tap0", disableHostLoopback, "", false, false, false)
 	if err != nil {
 		return nil, err
 	}
@@ -177,5 +198,12 @@ func createChildOpt() (*child.Opt, error) {
 	opt.CopyUpDriver = tmpfssymlink.NewChildDriver()
 	opt.MountProcfs = true
 	opt.Reaper = true
+	if v := os.Getenv(evacuateCgroup2Env); v != "" {
+		var err error
+		opt.EvacuateCgroup2, err = strconv.ParseBool(v)
+		if err != nil {
+			return nil, err
+		}
+	}
 	return opt, nil
 }

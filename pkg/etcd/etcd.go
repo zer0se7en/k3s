@@ -161,7 +161,7 @@ func (e *ETCD) IsInitialized(ctx context.Context, config *config.Control) (bool,
 }
 
 // Reset resets an etcd node
-func (e *ETCD) Reset(ctx context.Context, rebootstrap func() error, cleanCerts func()) error {
+func (e *ETCD) Reset(ctx context.Context, rebootstrap func() error) error {
 	// Wait for etcd to come up as a new single-node cluster, then exit
 	go func() {
 		t := time.NewTicker(5 * time.Second)
@@ -177,8 +177,6 @@ func (e *ETCD) Reset(ctx context.Context, rebootstrap func() error, cleanCerts f
 				if err := rebootstrap(); err != nil {
 					logrus.Fatal(err)
 				}
-
-				cleanCerts()
 
 				// call functions to rewrite them from daemons/control/server.go (prepare())
 				if err := deps.GenServerDeps(e.config, e.runtime); err != nil {
@@ -1013,5 +1011,13 @@ func (e *ETCD) GetMembersClientURLs(ctx context.Context) ([]string, error) {
 
 // RemoveSelf will remove the member if it exists in the cluster
 func (e *ETCD) RemoveSelf(ctx context.Context) error {
-	return e.removePeer(ctx, e.name, e.address, true)
+	if err := e.removePeer(ctx, e.name, e.address, true); err != nil {
+		return err
+	}
+
+	// backup the data dir to avoid issues when re-enabling etcd
+	oldDataDir := etcdDBDir(e.config) + "-old-" + strconv.Itoa(int(time.Now().Unix()))
+
+	// move the data directory to a temp path
+	return os.Rename(etcdDBDir(e.config), oldDataDir)
 }
