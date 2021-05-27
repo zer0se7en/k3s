@@ -1,5 +1,6 @@
 #!/bin/sh
 set -e
+set -o noglob
 
 # Usage:
 #   curl ... | ENV_VAR=... sh -
@@ -21,6 +22,9 @@ set -e
 #
 #   - INSTALL_K3S_SKIP_DOWNLOAD
 #     If set to true will not download k3s hash or binary.
+#
+#   - INSTALL_K3S_FORCE_RESTART
+#     If set to true will always restart the K3s service
 #
 #   - INSTALL_K3S_SYMLINK
 #     If set to 'skip' will not create symlinks, 'force' will overwrite,
@@ -486,6 +490,9 @@ install_selinux_rpm() {
     if [ -r /etc/redhat-release ] || [ -r /etc/centos-release ] || [ -r /etc/oracle-release ]; then
         dist_version="$(. /etc/os-release && echo "$VERSION_ID")"
         maj_ver=$(echo "$dist_version" | sed -E -e "s/^([0-9]+)\.?[0-9]*$/\1/")
+        set +o noglob
+        $SUDO rm -f /etc/yum.repos.d/rancher-k3s-common*.repo
+        set -o noglob
         if [ -r /etc/redhat-release ]; then
             case ${maj_ver} in
                 7)
@@ -500,7 +507,6 @@ install_selinux_rpm() {
                     ;;
             esac
         fi
-        $SUDO rm -f /etc/yum.repos.d/rancher-k3s-common*.repo
         $SUDO tee /etc/yum.repos.d/rancher-k3s-common.repo >/dev/null << EOF
 [rancher-k3s-common-${2}]
 name=Rancher K3s Common (${2})
@@ -617,6 +623,7 @@ do_unmount_and_remove() {
 do_unmount_and_remove '/run/k3s'
 do_unmount_and_remove '/var/lib/rancher/k3s'
 do_unmount_and_remove '/var/lib/kubelet/pods'
+do_unmount_and_remove '/var/lib/kubelet/plugins'
 do_unmount_and_remove '/run/netns/cni-'
 
 # Remove CNI namespaces
@@ -702,11 +709,10 @@ systemd_disable() {
 # --- capture current env and create file containing k3s_ variables ---
 create_env_file() {
     info "env: Creating environment file ${FILE_K3S_ENV}"
-    UMASK=$(umask)
-    umask 0377
+    $SUDO touch ${FILE_K3S_ENV}
+    $SUDO chmod 0600 ${FILE_K3S_ENV}
     env | grep '^K3S_' | $SUDO tee ${FILE_K3S_ENV} >/dev/null
-    env | egrep -i '^(NO|HTTP|HTTPS)_PROXY' | $SUDO tee -a ${FILE_K3S_ENV} >/dev/null
-    umask $UMASK
+    env | grep -Ei '^(NO|HTTP|HTTPS)_PROXY' | $SUDO tee -a ${FILE_K3S_ENV} >/dev/null
 }
 
 # --- write systemd service file ---
@@ -724,7 +730,9 @@ WantedBy=multi-user.target
 
 [Service]
 Type=${SYSTEMD_TYPE}
-EnvironmentFile=${FILE_K3S_ENV}
+EnvironmentFile=-/etc/default/%N
+EnvironmentFile=-/etc/sysconfig/%N
+EnvironmentFile=-${FILE_K3S_ENV}
 KillMode=process
 Delegate=yes
 # Having non-zero Limit*s causes performance problems due to accounting overhead
@@ -835,7 +843,7 @@ service_enable_and_start() {
     [ "${INSTALL_K3S_SKIP_START}" = true ] && return
 
     POST_INSTALL_HASHES=$(get_installed_hashes)
-    if [ "${PRE_INSTALL_HASHES}" = "${POST_INSTALL_HASHES}" ]; then
+    if [ "${PRE_INSTALL_HASHES}" = "${POST_INSTALL_HASHES}" ] && [ "${INSTALL_K3S_FORCE_RESTART}" != true ]; then
         info 'No change detected so skipping service start'
         return
     fi

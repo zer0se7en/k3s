@@ -6,8 +6,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 
+	"github.com/rancher/k3s/pkg/agent/util"
 	"github.com/rancher/wrangler/pkg/data/convert"
 	"gopkg.in/yaml.v2"
 )
@@ -19,7 +21,7 @@ type Parser struct {
 	DefaultConfig string
 }
 
-// Parser will parse an os.Args style slice looking for Parser.FlagNames after Parse.After.
+// Parse will parse an os.Args style slice looking for Parser.FlagNames after Parse.After.
 // It will read the parameter value of Parse.FlagNames and read the file, appending all flags directly after
 // the Parser.After value. This means a the non-config file flags will override, or if a slice append to, the config
 // file values.
@@ -110,19 +112,73 @@ func (p *Parser) findStart(args []string) ([]string, []string, bool) {
 	return args, nil, false
 }
 
+func dotDFiles(basefile string) (result []string, _ error) {
+	files, err := ioutil.ReadDir(basefile + ".d")
+	if os.IsNotExist(err) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+	for _, file := range files {
+		if file.IsDir() || !util.HasSuffixI(file.Name(), ".yaml", ".yml") {
+			continue
+		}
+		result = append(result, filepath.Join(basefile+".d", file.Name()))
+	}
+	return
+}
+
 func readConfigFile(file string) (result []string, _ error) {
-	bytes, err := readConfigFileData(file)
+	files, err := dotDFiles(file)
 	if err != nil {
 		return nil, err
 	}
 
-	data := yaml.MapSlice{}
-	if err := yaml.Unmarshal(bytes, &data); err != nil {
+	_, err = os.Stat(file)
+	if os.IsNotExist(err) && len(files) > 0 {
+	} else if err != nil {
 		return nil, err
+	} else {
+		files = append([]string{file}, files...)
 	}
 
-	for _, i := range data {
-		k, v := convert.ToString(i.Key), i.Value
+	var (
+		keySeen  = map[string]bool{}
+		keyOrder []string
+		values   = map[string]interface{}{}
+	)
+	for _, file := range files {
+		bytes, err := readConfigFileData(file)
+		if err != nil {
+			return nil, err
+		}
+
+		data := yaml.MapSlice{}
+		if err := yaml.Unmarshal(bytes, &data); err != nil {
+			return nil, err
+		}
+
+		for _, i := range data {
+			k, v := convert.ToString(i.Key), i.Value
+			isAppend := strings.HasSuffix(k, "+")
+			k = strings.TrimSuffix(k, "+")
+
+			if !keySeen[k] {
+				keySeen[k] = true
+				keyOrder = append(keyOrder, k)
+			}
+
+			if oldValue, ok := values[k]; ok && isAppend {
+				values[k] = append(toSlice(oldValue), toSlice(v)...)
+			} else {
+				values[k] = v
+			}
+		}
+	}
+
+	for _, k := range keyOrder {
+		v := values[k]
+
 		prefix := "--"
 		if len(k) == 1 {
 			prefix = "-"
@@ -139,6 +195,21 @@ func readConfigFile(file string) (result []string, _ error) {
 	}
 
 	return
+}
+
+func toSlice(v interface{}) []interface{} {
+	switch k := v.(type) {
+	case string:
+		return []interface{}{k}
+	case []interface{}:
+		return k
+	default:
+		str := strings.TrimSpace(convert.ToString(v))
+		if str == "" {
+			return nil
+		}
+		return []interface{}{str}
+	}
 }
 
 func readConfigFileData(file string) ([]byte, error) {

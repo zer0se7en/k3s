@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
+	"github.com/rancher/k3s/pkg/configfilearg"
 	"github.com/rancher/k3s/pkg/version"
 	corev1 "k8s.io/api/core/v1"
 )
@@ -25,7 +26,7 @@ const (
 
 func getNodeArgs() (string, error) {
 	nodeArgsList := []string{}
-	for _, arg := range os.Args[1:] {
+	for _, arg := range configfilearg.MustParse(os.Args[1:]) {
 		if strings.HasPrefix(arg, "--") && strings.Contains(arg, "=") {
 			parsedArg := strings.SplitN(arg, "=", 2)
 			nodeArgsList = append(nodeArgsList, parsedArg...)
@@ -102,11 +103,15 @@ func isSecret(key string) bool {
 		version.ProgramUpper + "_DATASTORE_ENDPOINT",
 		version.ProgramUpper + "_AGENT_TOKEN",
 		version.ProgramUpper + "_CLUSTER_SECRET",
+		"AWS_ACCESS_KEY_ID",
+		"AWS_SECRET_ACCESS_KEY",
 		"--token",
 		"-t",
 		"--agent-token",
 		"--datastore-endpoint",
 		"--cluster-secret",
+		"--etcd-s3-access-key",
+		"--etcd-s3-secret-key",
 	}
 	for _, secret := range secretData {
 		if key == secret {

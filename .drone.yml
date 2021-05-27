@@ -190,7 +190,6 @@ steps:
   environment:
     GCLOUD_AUTH:
       from_secret: gcloud_auth
-    GOLANG: golang:1.16.2-alpine3.12
   commands:
   - dapper ci
   - echo "${DRONE_TAG}-arm" | sed -e 's/+/-/g' >.tags
@@ -254,6 +253,28 @@ volumes:
 - name: docker
   host:
     path: /var/run/docker.sock
+
+---
+kind: pipeline
+name: validate_go_mods
+
+platform:
+  os: linux
+  arch: amd64
+
+steps:
+  - name: validate_go_mods
+    image: rancher/dapper:v0.5.0
+    commands:
+      - dapper -f Dockerfile.test.mod.dapper
+
+    volumes:
+      - name: docker
+        path: /var/run/docker.sock
+volumes:
+  - name: docker
+    host:
+      path: /var/run/docker.sock
 
 ---
 kind: pipeline

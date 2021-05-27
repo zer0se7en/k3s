@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/url"
@@ -14,6 +13,7 @@ import (
 	"github.com/containerd/cgroups"
 	cgroupsv2 "github.com/containerd/cgroups/v2"
 	systemd "github.com/coreos/go-systemd/daemon"
+	"github.com/pkg/errors"
 	"github.com/rancher/k3s/pkg/agent/config"
 	"github.com/rancher/k3s/pkg/agent/containerd"
 	"github.com/rancher/k3s/pkg/agent/flannel"
@@ -23,11 +23,13 @@ import (
 	"github.com/rancher/k3s/pkg/agent/tunnel"
 	"github.com/rancher/k3s/pkg/cli/cmds"
 	"github.com/rancher/k3s/pkg/clientaccess"
+	cp "github.com/rancher/k3s/pkg/cloudprovider"
 	"github.com/rancher/k3s/pkg/daemons/agent"
 	daemonconfig "github.com/rancher/k3s/pkg/daemons/config"
+	"github.com/rancher/k3s/pkg/daemons/executor"
 	"github.com/rancher/k3s/pkg/nodeconfig"
 	"github.com/rancher/k3s/pkg/rootless"
-	"github.com/rancher/k3s/pkg/version"
+	"github.com/rancher/k3s/pkg/util"
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,12 +38,10 @@ import (
 	v1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/controller-manager/app"
-)
-
-var (
-	InternalIPLabel = version.Program + ".io/internal-ip"
-	ExternalIPLabel = version.Program + ".io/external-ip"
-	HostnameLabel   = version.Program + ".io/hostname"
+	app2 "k8s.io/kubernetes/cmd/kube-proxy/app"
+	kubeproxyconfig "k8s.io/kubernetes/pkg/proxy/apis/config"
+	utilsnet "k8s.io/utils/net"
+	utilpointer "k8s.io/utils/pointer"
 )
 
 const (
@@ -76,7 +76,31 @@ func setupCriCtlConfig(cfg cmds.Agent, nodeConfig *daemonconfig.Node) error {
 func run(ctx context.Context, cfg cmds.Agent, proxy proxy.Proxy) error {
 	nodeConfig := config.Get(ctx, cfg, proxy)
 
+	dualCluster, err := utilsnet.IsDualStackCIDRs(nodeConfig.AgentConfig.ClusterCIDRs)
+	if err != nil {
+		return errors.Wrap(err, "failed to validate cluster-cidr")
+	}
+	dualService, err := utilsnet.IsDualStackCIDRs(nodeConfig.AgentConfig.ServiceCIDRs)
+	if err != nil {
+		return errors.Wrap(err, "failed to validate service-cidr")
+	}
+	dualNode, err := utilsnet.IsDualStackIPs(nodeConfig.AgentConfig.NodeIPs)
+	if err != nil {
+		return errors.Wrap(err, "failed to validate node-ip")
+	}
+
+	enableIPv6 := dualCluster || dualService || dualNode
+	conntrackConfig, err := getConntrackConfig(nodeConfig)
+	if err != nil {
+		return errors.Wrap(err, "failed to validate kube-proxy conntrack configuration")
+	}
+	syssetup.Configure(enableIPv6, conntrackConfig)
+
 	if err := setupCriCtlConfig(cfg, nodeConfig); err != nil {
+		return err
+	}
+
+	if err := executor.Bootstrap(ctx, nodeConfig, cfg); err != nil {
 		return err
 	}
 
@@ -122,6 +146,49 @@ func run(ctx context.Context, cfg cmds.Agent, proxy proxy.Proxy) error {
 	return ctx.Err()
 }
 
+// getConntrackConfig uses the kube-proxy code to parse the user-provided kube-proxy-arg values, and
+// extract the conntrack settings so that K3s can set them itself. This allows us to soft-fail when
+// running K3s in Docker, where kube-proxy is no longer allowed to set conntrack sysctls on newer kernels.
+// When running rootless, we do not attempt to set conntrack sysctls - this behavior is copied from kubeadm.
+func getConntrackConfig(nodeConfig *daemonconfig.Node) (*kubeproxyconfig.KubeProxyConntrackConfiguration, error) {
+	ctConfig := &kubeproxyconfig.KubeProxyConntrackConfiguration{
+		MaxPerCore:            utilpointer.Int32Ptr(0),
+		Min:                   utilpointer.Int32Ptr(0),
+		TCPEstablishedTimeout: &metav1.Duration{},
+		TCPCloseWaitTimeout:   &metav1.Duration{},
+	}
+
+	if nodeConfig.AgentConfig.Rootless {
+		return ctConfig, nil
+	}
+
+	cmd := app2.NewProxyCommand()
+	if err := cmd.ParseFlags(daemonconfig.GetArgsList(map[string]string{}, nodeConfig.AgentConfig.ExtraKubeProxyArgs)); err != nil {
+		return nil, err
+	}
+	maxPerCore, err := cmd.Flags().GetInt32("conntrack-max-per-core")
+	if err != nil {
+		return nil, err
+	}
+	ctConfig.MaxPerCore = &maxPerCore
+	min, err := cmd.Flags().GetInt32("conntrack-min")
+	if err != nil {
+		return nil, err
+	}
+	ctConfig.Min = &min
+	establishedTimeout, err := cmd.Flags().GetDuration("conntrack-tcp-timeout-established")
+	if err != nil {
+		return nil, err
+	}
+	ctConfig.TCPEstablishedTimeout.Duration = establishedTimeout
+	closeWaitTimeout, err := cmd.Flags().GetDuration("conntrack-tcp-timeout-close-wait")
+	if err != nil {
+		return nil, err
+	}
+	ctConfig.TCPCloseWaitTimeout.Duration = closeWaitTimeout
+	return ctConfig, nil
+}
+
 func coreClient(cfg string) (kubernetes.Interface, error) {
 	restConfig, err := clientcmd.BuildConfigFromFlags("", cfg)
 	if err != nil {
@@ -135,7 +202,6 @@ func Run(ctx context.Context, cfg cmds.Agent) error {
 	if err := validate(); err != nil {
 		return err
 	}
-	syssetup.Configure()
 
 	if cfg.Rootless && !cfg.RootlessAlreadyUnshared {
 		if err := rootless.Rootless(cfg.DataDir); err != nil {
@@ -231,22 +297,30 @@ func configureNode(ctx context.Context, agentConfig *daemonconfig.Agent, nodes v
 			continue
 		}
 
-		newLabels, updateMutables := updateMutableLabels(agentConfig, node.Labels)
+		updateNode := false
+		if labels, changed := updateMutableLabels(agentConfig, node.Labels); changed {
+			node.Labels = labels
+			updateNode = true
+		}
 
-		updateAddresses := !agentConfig.DisableCCM
-		if updateAddresses {
-			newLabels, updateAddresses = updateAddressLabels(agentConfig, newLabels)
+		if !agentConfig.DisableCCM {
+			if annotations, changed := updateAddressAnnotations(agentConfig, node.Annotations); changed {
+				node.Annotations = annotations
+				updateNode = true
+			}
+			if labels, changed := updateLegacyAddressLabels(agentConfig, node.Labels); changed {
+				node.Labels = labels
+				updateNode = true
+			}
 		}
 
 		// inject node config
-		updateNode, err := nodeconfig.SetNodeConfigAnnotations(node)
-		if err != nil {
+		if changed, err := nodeconfig.SetNodeConfigAnnotations(node); err != nil {
 			return err
-		}
-		if updateAddresses || updateMutables {
-			node.Labels = newLabels
+		} else if changed {
 			updateNode = true
 		}
+
 		if updateNode {
 			if _, err := nodes.Update(ctx, node, metav1.UpdateOptions{}); err != nil {
 				logrus.Infof("Failed to update node %s: %v", agentConfig.NodeName, err)
@@ -286,18 +360,36 @@ func updateMutableLabels(agentConfig *daemonconfig.Agent, nodeLabels map[string]
 	return result, !equality.Semantic.DeepEqual(nodeLabels, result)
 }
 
-func updateAddressLabels(agentConfig *daemonconfig.Agent, nodeLabels map[string]string) (map[string]string, bool) {
+func updateLegacyAddressLabels(agentConfig *daemonconfig.Agent, nodeLabels map[string]string) (map[string]string, bool) {
+	ls := labels.Set(nodeLabels)
+	if ls.Has(cp.InternalIPKey) || ls.Has(cp.HostnameKey) {
+		result := map[string]string{
+			cp.InternalIPKey: agentConfig.NodeIP,
+			cp.HostnameKey:   agentConfig.NodeName,
+		}
+
+		if agentConfig.NodeExternalIP != "" {
+			result[cp.ExternalIPKey] = agentConfig.NodeExternalIP
+		}
+
+		result = labels.Merge(nodeLabels, result)
+		return result, !equality.Semantic.DeepEqual(nodeLabels, result)
+	}
+	return nil, false
+}
+
+func updateAddressAnnotations(agentConfig *daemonconfig.Agent, nodeAnnotations map[string]string) (map[string]string, bool) {
 	result := map[string]string{
-		InternalIPLabel: agentConfig.NodeIP,
-		HostnameLabel:   agentConfig.NodeName,
+		cp.InternalIPKey: util.JoinIPs(agentConfig.NodeIPs),
+		cp.HostnameKey:   agentConfig.NodeName,
 	}
 
 	if agentConfig.NodeExternalIP != "" {
-		result[ExternalIPLabel] = agentConfig.NodeExternalIP
+		result[cp.ExternalIPKey] = util.JoinIPs(agentConfig.NodeExternalIPs)
 	}
 
-	result = labels.Merge(nodeLabels, result)
-	return result, !equality.Semantic.DeepEqual(nodeLabels, result)
+	result = labels.Merge(nodeAnnotations, result)
+	return result, !equality.Semantic.DeepEqual(nodeAnnotations, result)
 }
 
 // setupTunnelAndRunAgent should start the setup tunnel before starting kubelet and kubeproxy
@@ -325,6 +417,11 @@ func setupTunnelAndRunAgent(ctx context.Context, nodeConfig *daemonconfig.Node, 
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	} else if cfg.ClusterReset && proxy.IsAPIServerLBEnabled() {
+		if err := agent.Agent(&nodeConfig.AgentConfig); err != nil {
+			return err
+		}
+		agentRan = true
 	}
 
 	if err := tunnel.Setup(ctx, nodeConfig, proxy); err != nil {
