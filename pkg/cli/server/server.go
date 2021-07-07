@@ -14,6 +14,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/rancher/k3s/pkg/agent"
 	"github.com/rancher/k3s/pkg/cli/cmds"
+	"github.com/rancher/k3s/pkg/clientaccess"
 	"github.com/rancher/k3s/pkg/datadir"
 	"github.com/rancher/k3s/pkg/etcd"
 	"github.com/rancher/k3s/pkg/netutil"
@@ -118,6 +119,7 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 	serverConfig.ControlConfig.ExtraCloudControllerArgs = cfg.ExtraCloudControllerArgs
 	serverConfig.ControlConfig.DisableCCM = cfg.DisableCCM
 	serverConfig.ControlConfig.DisableNPC = cfg.DisableNPC
+	serverConfig.ControlConfig.DisableHelmController = cfg.DisableHelmController
 	serverConfig.ControlConfig.DisableKubeProxy = cfg.DisableKubeProxy
 	serverConfig.ControlConfig.DisableETCD = cfg.DisableETCD
 	serverConfig.ControlConfig.DisableAPIServer = cfg.DisableAPIServer
@@ -129,6 +131,10 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 	serverConfig.ControlConfig.EtcdSnapshotCron = cfg.EtcdSnapshotCron
 	serverConfig.ControlConfig.EtcdSnapshotDir = cfg.EtcdSnapshotDir
 	serverConfig.ControlConfig.EtcdSnapshotRetention = cfg.EtcdSnapshotRetention
+
+	if cfg.EtcdDisableSnapshots {
+		logrus.Info("ETCD snapshots are disabled")
+	}
 	serverConfig.ControlConfig.EtcdDisableSnapshots = cfg.EtcdDisableSnapshots
 	serverConfig.ControlConfig.EtcdExposeMetrics = cfg.EtcdExposeMetrics
 	serverConfig.ControlConfig.EtcdS3 = cfg.EtcdS3
@@ -358,8 +364,6 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 	}
 
 	logrus.Info("Starting " + version.Program + " " + app.App.Version)
-	notifySocket := os.Getenv("NOTIFY_SOCKET")
-	os.Unsetenv("NOTIFY_SOCKET")
 
 	ctx := signals.SetupSignalHandler(context.Background())
 
@@ -375,9 +379,9 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 			<-serverConfig.ControlConfig.Runtime.ETCDReady
 			logrus.Info("ETCD server is now running")
 		}
+
 		logrus.Info(version.Program + " is up and running")
-		if notifySocket != "" {
-			os.Setenv("NOTIFY_SOCKET", notifySocket)
+		if cfg.DisableAgent && os.Getenv("NOTIFY_SOCKET") != "" {
 			systemd.SdNotify(true, "READY=1\n")
 		}
 	}()
@@ -393,7 +397,7 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 	}
 
 	url := fmt.Sprintf("https://%s:%d", ip, serverConfig.ControlConfig.SupervisorPort)
-	token, err := server.FormatToken(serverConfig.ControlConfig.Runtime.AgentToken, serverConfig.ControlConfig.Runtime.ServerCA)
+	token, err := clientaccess.FormatToken(serverConfig.ControlConfig.Runtime.AgentToken, serverConfig.ControlConfig.Runtime.ServerCA)
 	if err != nil {
 		return err
 	}

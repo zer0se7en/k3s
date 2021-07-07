@@ -3,15 +3,12 @@ package agent
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/containerd/cgroups"
-	cgroupsv2 "github.com/containerd/cgroups/v2"
 	systemd "github.com/coreos/go-systemd/daemon"
 	"github.com/pkg/errors"
 	"github.com/rancher/k3s/pkg/agent/config"
@@ -21,6 +18,7 @@ import (
 	"github.com/rancher/k3s/pkg/agent/proxy"
 	"github.com/rancher/k3s/pkg/agent/syssetup"
 	"github.com/rancher/k3s/pkg/agent/tunnel"
+	"github.com/rancher/k3s/pkg/cgroups"
 	"github.com/rancher/k3s/pkg/cli/cmds"
 	"github.com/rancher/k3s/pkg/clientaccess"
 	cp "github.com/rancher/k3s/pkg/cloudprovider"
@@ -43,35 +41,6 @@ import (
 	utilsnet "k8s.io/utils/net"
 	utilpointer "k8s.io/utils/pointer"
 )
-
-const (
-	dockershimSock = "unix:///var/run/dockershim.sock"
-	containerdSock = "unix:///run/k3s/containerd/containerd.sock"
-)
-
-// setupCriCtlConfig creates the crictl config file and populates it
-// with the given data from config.
-func setupCriCtlConfig(cfg cmds.Agent, nodeConfig *daemonconfig.Node) error {
-	cre := nodeConfig.ContainerRuntimeEndpoint
-	if cre == "" {
-		switch {
-		case cfg.Docker:
-			cre = dockershimSock
-		default:
-			cre = containerdSock
-		}
-	}
-
-	agentConfDir := filepath.Join(cfg.DataDir, "agent", "etc")
-	if _, err := os.Stat(agentConfDir); os.IsNotExist(err) {
-		if err := os.MkdirAll(agentConfDir, 0700); err != nil {
-			return err
-		}
-	}
-
-	crp := "runtime-endpoint: " + cre + "\n"
-	return ioutil.WriteFile(agentConfDir+"/crictl.yaml", []byte(crp), 0600)
-}
 
 func run(ctx context.Context, cfg cmds.Agent, proxy proxy.Proxy) error {
 	nodeConfig := config.Get(ctx, cfg, proxy)
@@ -115,6 +84,10 @@ func run(ctx context.Context, cfg cmds.Agent, proxy proxy.Proxy) error {
 			return err
 		}
 	}
+
+	notifySocket := os.Getenv("NOTIFY_SOCKET")
+	os.Unsetenv("NOTIFY_SOCKET")
+
 	if err := setupTunnelAndRunAgent(ctx, nodeConfig, cfg, proxy); err != nil {
 		return err
 	}
@@ -141,6 +114,9 @@ func run(ctx context.Context, cfg cmds.Agent, proxy proxy.Proxy) error {
 			return err
 		}
 	}
+
+	os.Setenv("NOTIFY_SOCKET", notifySocket)
+	systemd.SdNotify(true, "READY=1\n")
 
 	<-ctx.Done()
 	return ctx.Err()
@@ -199,7 +175,7 @@ func coreClient(cfg string) (kubernetes.Interface, error) {
 }
 
 func Run(ctx context.Context, cfg cmds.Agent) error {
-	if err := validate(); err != nil {
+	if err := cgroups.Validate(); err != nil {
 		return err
 	}
 
@@ -233,55 +209,8 @@ func Run(ctx context.Context, cfg cmds.Agent) error {
 		cfg.Token = newToken.String()
 		break
 	}
-	systemd.SdNotify(true, "READY=1\n")
+
 	return run(ctx, cfg, proxy)
-}
-
-func validate() error {
-	if cgroups.Mode() == cgroups.Unified {
-		return validateCgroupsV2()
-	}
-	return validateCgroupsV1()
-}
-
-func validateCgroupsV1() error {
-	cgroups, err := ioutil.ReadFile("/proc/self/cgroup")
-	if err != nil {
-		return err
-	}
-
-	if !strings.Contains(string(cgroups), "cpuset") {
-		logrus.Warn(`Failed to find cpuset cgroup, you may need to add "cgroup_enable=cpuset" to your linux cmdline (/boot/cmdline.txt on a Raspberry Pi)`)
-	}
-
-	if !strings.Contains(string(cgroups), "memory") {
-		msg := "ailed to find memory cgroup, you may need to add \"cgroup_memory=1 cgroup_enable=memory\" to your linux cmdline (/boot/cmdline.txt on a Raspberry Pi)"
-		logrus.Error("F" + msg)
-		return errors.New("f" + msg)
-	}
-
-	return nil
-}
-
-func validateCgroupsV2() error {
-	manager, err := cgroupsv2.LoadManager("/sys/fs/cgroup", "/")
-	if err != nil {
-		return err
-	}
-	controllers, err := manager.RootControllers()
-	if err != nil {
-		return err
-	}
-	m := make(map[string]struct{})
-	for _, controller := range controllers {
-		m[controller] = struct{}{}
-	}
-	for _, controller := range []string{"cpu", "cpuset", "memory"} {
-		if _, ok := m[controller]; !ok {
-			return fmt.Errorf("failed to find %s cgroup (v2)", controller)
-		}
-	}
-	return nil
 }
 
 func configureNode(ctx context.Context, agentConfig *daemonconfig.Agent, nodes v1.NodeInterface) error {
